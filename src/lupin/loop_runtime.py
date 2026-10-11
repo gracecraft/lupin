@@ -47,6 +47,9 @@ UNFINISHED_GIT_STATES = (
     ("REVERT_HEAD", "revert"),
 )
 SERVER_START_TIMEOUT = 30.0
+PANE_READ_TIMEOUT = 60.0
+SYSTEMCTL_CHECK_TIMEOUT = 3.0
+SYSTEMCTL_STOP_TIMEOUT = 30.0
 LEASE_TTL = 60.0
 HANDOFF_GRACE_S = 600.0
 HANDOFF_TEXT = (
@@ -406,7 +409,7 @@ def enabled_repos() -> dict[str, str]:
     values: dict[str, str] = {}
     try:
         lines = REPOS_FILE.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise LoopError(f"could not read {REPOS_FILE}: {exc}") from exc
     for line in lines:
         fields = line.split()
@@ -1301,7 +1304,7 @@ def _save_report(repo: str, session: str, workspace: dict) -> Path:
     pane = _pane_id(workspace)
     if not pane:
         raise HerdrError("Herdr workspace has no pane ID")
-    output = _herdr(session, "pane", "read", pane, "--source", "recent", "--lines", "100000", "--format", "text", timeout=60.0)
+    output = _herdr(session, "pane", "read", pane, "--source", "recent", "--lines", "100000", "--format", "text", timeout=PANE_READ_TIMEOUT)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True, mode=0o750)
     path = REPORTS_DIR / f"{validate_repo(repo)}-{_stamp()}-{time.time_ns() % 1000000:06d}.log"
     temporary = path.with_suffix(path.suffix + ".part")
@@ -1367,11 +1370,11 @@ def stop_loop(repo: str, *, force: bool = False, grace: float = HANDOFF_GRACE_S)
             if not workspace_id:
                 raise HerdrError("Herdr workspace has no ID")
             _herdr_json(session, "workspace", "close", workspace_id)
-        _, state = _run(["systemctl", "is-active", f"{unit_name(repo)}.service"], timeout=3.0)
+        _, state = _run(["systemctl", "is-active", f"{unit_name(repo)}.service"], timeout=SYSTEMCTL_CHECK_TIMEOUT)
         if state in {"active", "activating", "deactivating"}:
             rc, output = _run(
                 _sudo_argv("systemctl", "stop", f"{unit_name(repo)}.service"),
-                timeout=30.0,
+                timeout=SYSTEMCTL_STOP_TIMEOUT,
             )
             if rc:
                 raise LoopError(output or f"could not stop Lupin worker for {repo}")
@@ -1383,7 +1386,7 @@ def stop_loop(repo: str, *, force: bool = False, grace: float = HANDOFF_GRACE_S)
         metadata["workspace_id"] = None
         metadata["pane_id"] = None
         _write_metadata(repo, metadata)
-        return (
+        message = (
             f"stopped {repo}"
             + (f"; report saved to {report}" if report else "")
             + handoff_note
@@ -1391,6 +1394,45 @@ def stop_loop(repo: str, *, force: bool = False, grace: float = HANDOFF_GRACE_S)
         )
     finally:
         lock.close()
+    _write_debrief(repo, metadata, forced=force)
+    return message
+
+
+def _write_debrief(repo: str, metadata: dict, *, forced: bool) -> None:
+    """Write the debrief. The stop already happened, so a failure only prints a warning."""
+    # Local import: debrief -> roadmap -> loop_runtime is a cycle.
+    from . import debrief
+
+    try:
+        debrief.write_debrief(
+            STATE_DIR, repo, CODE_DIR / repo, metadata.get("started_at"), forced=forced,
+        )
+    except Exception as exc:
+        print(f"lupin loop: no debrief for {repo}: {exc}", file=sys.stderr)
+
+
+def write_due_periodic_debriefs(now: datetime | None = None) -> None:
+    """Write each periodic debrief that is due. A failure only prints a warning."""
+    # Local import: debrief -> roadmap -> loop_runtime is a cycle.
+    from . import debrief
+
+    now = datetime.now(timezone.utc) if now is None else now
+    try:
+        repos = enabled_repos()
+    except (LoopError, OSError) as exc:
+        # enabled_repos writes the default file when it is missing. That write can raise OSError.
+        print(f"lupin agent: no periodic debriefs: {exc} ({REPOS_FILE})", file=sys.stderr)
+        return
+    for repo in repos:
+        checkout = CODE_DIR / repo
+        if not checkout.is_dir():
+            continue
+        for period in debrief.PERIODS:
+            try:
+                if debrief.period_due(STATE_DIR, repo, period, now):
+                    debrief.write_period(STATE_DIR, repo, checkout, period, now=now)
+            except Exception as exc:
+                print(f"lupin agent: no {period} debrief for {repo}: {exc}", file=sys.stderr)
 
 
 def peek_loop(repo: str, lines: int = 60) -> str:

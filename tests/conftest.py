@@ -96,6 +96,53 @@ def closed_port() -> int:
     return _free_port()
 
 
+class CountingRedis:
+    """Wraps a real client. Records each method the code under test calls.
+
+    A pipeline's `execute()` is recorded as `execute`. Each `execute()` is
+    one round trip, so `calls` shows the round trips.
+    """
+
+    def __init__(self, client):
+        self.client = client
+        self.calls: list[str] = []
+
+    def __getattr__(self, name):
+        attr = getattr(self.client, name)
+
+        def counted(*args, **kwargs):
+            self.calls.append(name)
+            result = attr(*args, **kwargs)
+            if name == "pipeline":
+                return _CountingPipeline(result, self.calls)
+            return result
+
+        return counted
+
+
+class _CountingPipeline:
+    def __init__(self, pipe, calls: list[str]):
+        self.pipe = pipe
+        self.calls = calls
+
+    def __getattr__(self, name):
+        attr = getattr(self.pipe, name)
+        if name != "execute":
+            return attr
+
+        def execute(*args, **kwargs):
+            self.calls.append("execute")
+            return attr(*args, **kwargs)
+
+        return execute
+
+
+@pytest.fixture
+def counting_redis():
+    """The `CountingRedis` class. Call it with a client to wrap that client."""
+    return CountingRedis
+
+
 @pytest.fixture
 def no_client_retry(monkeypatch):
     """Make `slots_redis._client` return a client that does not retry.

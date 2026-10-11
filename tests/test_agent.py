@@ -9,7 +9,10 @@ They check signed queue actions and results against Redis.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import re
+import socket
 import threading
 import time
 from types import SimpleNamespace
@@ -17,7 +20,7 @@ from types import SimpleNamespace
 import pytest
 import redis as redis_lib
 
-from lupin import agent, commands, slots
+from lupin import agent, commands, debrief, loop_runtime, slots, slots_redis
 
 KEY = "secret"
 ACTOR_KW = {"actor": "grace", "issuer": "test-host"}
@@ -260,8 +263,237 @@ def test_loop_stop_gets_more_time_than_other_actions(redis_port, flush_redis, mo
 
     agent.poll_once("jesus", KEY, **kw)
 
-    assert timeouts == [agent.ACTION_TIMEOUT_S["loop.stop"]]
+    assert timeouts == [agent.SUBPROCESS_TIMEOUT_S["loop.stop"]]
     assert timeouts[0] > agent.EXEC_TIMEOUT_S
+
+
+# Worst case for one debrief_client call, in seconds. It is
+# agent.DEBRIEF_CALL_WORST_S. docs/redis-schema.md has the derivation.
+DEBRIEF_CALL_S = agent.DEBRIEF_CALL_WORST_S
+POLL_S = 0.25  # loop_runtime._wait_for_server, time.sleep(0.25)
+
+
+def test_stop_subprocess_cap_leaves_room_for_agent_redis_calls(redis_port, flush_redis, monkeypatch):
+    kw = {"redis_host": "127.0.0.1", "redis_port": redis_port}
+    commands.enqueue("jesus", "loop.stop", {"repo": "lupin"}, key=KEY, **ACTOR_KW, **kw)
+    timeouts = []
+
+    def run(argv, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(agent.subprocess, "run", run)
+
+    agent.poll_once("jesus", KEY, **kw)
+
+    time_limit = agent.ACTION_TIMEOUT_S["loop.stop"]
+    agent_s = agent.COMMAND_READ_WORST_S + agent.AGENT_REDIS_CALLS_ON_STOP * DEBRIEF_CALL_S
+    worst = timeouts[0] + agent_s
+    assert worst <= time_limit, (
+        f"subprocess {timeouts[0]:g}s + agent Redis calls {agent_s:g}s = {worst:g}s. "
+        f"time limit is {time_limit:g}s"
+    )
+
+
+def test_stop_time_limit_covers_the_listed_timeouts():
+    # Each term is one worst-case wait, in seconds, on the non-forced stop path.
+    # Subprocess terms run inside the stop subprocess, one after another.
+    # Agent terms run in agent.py, outside the subprocess.
+    # The test cannot see a timeout that is not listed here. Add new ones here.
+    subprocess_terms = [
+        # Ensure the server (loop_runtime.py:784, 772, 775, 776, 758-763, 791, 794)
+        ("server: running check", loop_runtime.HERDR_TIMEOUT),
+        ("server: running check under the machine lock", loop_runtime.HERDR_TIMEOUT),
+        ("server: systemd-run start", loop_runtime.HERDR_TIMEOUT),
+        ("server: running check after failed start", loop_runtime.HERDR_TIMEOUT),
+        ("server: wait for server", loop_runtime.SERVER_START_TIMEOUT + loop_runtime.HERDR_TIMEOUT + POLL_S),
+        # Find the workspace (loop_runtime.py:288, 293)
+        ("workspace list", loop_runtime.HERDR_TIMEOUT),
+        ("pane list fallback", loop_runtime.HERDR_TIMEOUT),
+        # Ask for a handoff (loop_runtime.py:305, 1093-1096)
+        ("agent list", loop_runtime.HERDR_TIMEOUT),
+        ("agent prompt --wait", loop_runtime.HANDOFF_GRACE_S + loop_runtime.HERDR_TIMEOUT),
+        # Save report, close, stop worker (loop_runtime.py:1062, 1127, 1128, 1131-1132)
+        ("pane read for report", loop_runtime.PANE_READ_TIMEOUT),
+        ("workspace close", loop_runtime.HERDR_TIMEOUT),
+        ("systemctl is-active", loop_runtime.SYSTEMCTL_CHECK_TIMEOUT),
+        ("systemctl stop", loop_runtime.SYSTEMCTL_STOP_TIMEOUT),
+        # Stop a session other than the shared one (loop_runtime.py:1136, 1137)
+        ("session: workspace list", loop_runtime.HERDR_TIMEOUT),
+        ("session: pane list fallback", loop_runtime.HERDR_TIMEOUT),
+        ("session: session stop", loop_runtime.HERDR_TIMEOUT),
+        # Debrief, inside the subprocess. All gh calls share one time limit.
+        ("debrief: all gh calls (repo view and lists)", debrief.DEBRIEF_TIME_LIMIT_S),
+        ("debrief: ledger read (Redis)", DEBRIEF_CALL_S),
+        # Known limit: this term assumes one SCAN request and reply. See docs/redis-schema.md.
+        ("debrief: claims scan (Redis)", DEBRIEF_CALL_S),
+        ("debrief: claims read (Redis)", DEBRIEF_CALL_S),
+    ]
+    # The command read uses _client. The five calls after it use debrief_client.
+    # The claim read runs only when SET NX returns nil. It is listed even when it does not run.
+    agent_terms = [
+        ("agent: write claim", DEBRIEF_CALL_S),
+        ("agent: read claim back", DEBRIEF_CALL_S),
+        ("agent: write result", DEBRIEF_CALL_S),
+        ("agent: dequeue", DEBRIEF_CALL_S),
+        ("agent: audit line", DEBRIEF_CALL_S),
+    ]
+    assert len(agent_terms) == agent.AGENT_REDIS_CALLS_ON_STOP
+    agent_s = agent.COMMAND_READ_WORST_S + sum(seconds for _, seconds in agent_terms)
+    subprocess_s = sum(seconds for _, seconds in subprocess_terms)
+    total = subprocess_s + agent_s
+    time_limit = agent.ACTION_TIMEOUT_S["loop.stop"]
+    assert total <= time_limit, (
+        f"stop can take {total:.2f}s (subprocess {subprocess_s:.2f}s + agent {agent_s:.2f}s). "
+        f"time limit is {time_limit:g}s"
+    )
+
+
+def test_debrief_redis_calls_fit_the_listed_redis_terms(
+    tmp_path, monkeypatch, redis_port, flush_redis, counting_redis
+):
+    checkout = tmp_path / "widgets"
+    checkout.mkdir()
+    client = redis_lib.Redis(host="127.0.0.1", port=redis_port, decode_responses=True)
+    for number in range(1, 6):
+        client.set(f"lupin:v1:claim:acme/widgets#{number}", json.dumps({"host": "jesus", "session": "s", "since": 0}))
+    counting = counting_redis(client)
+    monkeypatch.setattr(debrief, "_gh", lambda args, cwd=None, timeout=None: (
+        {"nameWithOwner": "acme/widgets"} if args[0] == "repo" else []
+    ))
+    monkeypatch.setattr(debrief.slots_redis, "debrief_client", lambda *_args: counting)
+
+    debrief.write_debrief(tmp_path, "widgets", checkout, "2026-10-02T09:00:00Z")
+
+    # Listed debrief Redis terms: ledger read, claims scan, claims read. Each is one request and reply.
+    # Building a batch sends nothing. Its execute() sends the batch.
+    listed_s = 3 * DEBRIEF_CALL_S
+    round_trips = [name for name in counting.calls if name != "pipeline"]
+    assert round_trips == ["xrange", "scan_iter", "execute"], counting.calls
+    assert len(round_trips) * DEBRIEF_CALL_S <= listed_s
+
+
+def test_debrief_client_has_short_timeouts_and_no_redis_retry():
+    client = slots_redis.debrief_client(None, None)
+    kwargs = client.connection_pool.connection_kwargs
+    assert kwargs["socket_timeout"] == slots_redis.DEBRIEF_TIMEOUT_S
+    assert kwargs["socket_connect_timeout"] == slots_redis.DEBRIEF_TIMEOUT_S
+    # No redis-py retry. _call_with_retry gives the one retry.
+    assert client.get_retry().get_retries() == 0
+
+
+def test_command_takes_five_round_trips(redis_port):
+    # A new connection sends the handshake, then the command. The relay
+    # counts each command on the wire. agent.REDIS_ROUND_TRIPS sets the
+    # worst-case bound. A redis-py change that adds a handshake command fails
+    # this test. (INFO commandstats misses one handshake command, so it is not used.)
+    commands_seen: list[bytes] = []
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(10)
+    threading.Thread(target=_relay, args=(listener, redis_port, 0.0, commands_seen), daemon=True).start()
+    try:
+        client = slots_redis.debrief_client("127.0.0.1", listener.getsockname()[1])
+        client.get("lupin-test:round-trips")
+    finally:
+        listener.close()
+    assert len(commands_seen) == agent.REDIS_ROUND_TRIPS
+
+
+def test_default_client_retries_match_the_read_bound():
+    # agent.COMMAND_READ_WORST_S assumes redis-py's default retry count.
+    assert slots_redis._client("127.0.0.1", 1).get_retry().get_retries() == agent.DEFAULT_CLIENT_RETRIES
+
+
+def _forward(src, dst, delay_s, commands_seen=None):
+    with contextlib.suppress(OSError):
+        while data := src.recv(65536):
+            if commands_seen is not None:
+                commands_seen.extend(re.findall(rb"\*\d+\r\n", data))  # one array header per command
+            time.sleep(delay_s)
+            dst.sendall(data)
+
+
+def _relay(listener, upstream_port, reply_delay_s, commands_seen=None):
+    # Forwards each connection to the server. Each reply waits reply_delay_s first.
+    while True:
+        try:
+            front, _ = listener.accept()
+        except OSError:
+            return  # the listener was closed
+        back = socket.create_connection(("127.0.0.1", upstream_port))
+        threading.Thread(target=_forward, args=(front, back, 0.0, commands_seen), daemon=True).start()
+        threading.Thread(target=_forward, args=(back, front, reply_delay_s), daemon=True).start()
+
+
+def test_non_stop_command_survives_a_reply_slower_than_the_stop_bound(redis_port, flush_redis, monkeypatch):
+    # Each reply takes 1.2 s. That is over the 1 s bound on loop.stop calls.
+    # It is under the 2 s bound on other calls. A loop.peek must still run.
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(10)
+    threading.Thread(target=_relay, args=(listener, redis_port, 1.2), daemon=True).start()
+    kw = {"redis_host": "127.0.0.1", "redis_port": redis_port}
+    cmd_id = commands.enqueue("jesus", "loop.peek", {"repo": "lupin", "lines": "20"}, key=KEY, **ACTOR_KW, **kw)
+    monkeypatch.setattr(agent.subprocess, "run", lambda argv, **_kwargs: SimpleNamespace(returncode=0, stdout="ok", stderr=""))
+    try:
+        touched = agent.poll_once("jesus", KEY, redis_host="127.0.0.1", redis_port=listener.getsockname()[1])
+    finally:
+        listener.close()
+    assert touched == [{"id": cmd_id, "state": "ok"}]
+
+
+def test_stop_result_write_failure_leaves_the_claim_until_restart(redis_port, flush_redis, monkeypatch):
+    # Known limit: the stop ran, but its result write failed. The result stays
+    # "running" until the next start marks it failed as orphaned.
+    kw = {"redis_host": "127.0.0.1", "redis_port": redis_port}
+    cmd_id = commands.enqueue("jesus", "loop.stop", {"repo": "lupin"}, key=KEY, **ACTOR_KW, **kw)
+    monkeypatch.setattr(agent.subprocess, "run", lambda argv, **_kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    real_write = agent._write_result
+
+    def failing_write(*_args, **_kwargs):
+        raise redis_lib.exceptions.ConnectionError("write failed")
+
+    monkeypatch.setattr(agent, "_write_result", failing_write)
+    with pytest.raises(slots.CoordinatorUnreachable):
+        agent.poll_once("jesus", KEY, **kw)
+    monkeypatch.setattr(agent, "_write_result", real_write)
+
+    assert commands.get_status(cmd_id, **kw)["state"] == "running"
+    assert agent.startup_scan("jesus", **kw) == [cmd_id]
+    assert commands.get_status(cmd_id, **kw)["state"] == "failed"
+
+
+def _hold_connections(server, held):
+    while True:
+        try:
+            conn, _ = server.accept()
+        except OSError:
+            return  # the server socket was closed
+        held.append(conn)
+
+
+def test_debrief_call_on_a_stalled_server_ends_inside_its_budget():
+    # Stall: the server accepts each connection and never replies.
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", 0))
+    server.listen(10)
+    held: list[socket.socket] = []
+    threading.Thread(target=_hold_connections, args=(server, held), daemon=True).start()
+    client = slots_redis.debrief_client("127.0.0.1", server.getsockname()[1])
+    try:
+        start = time.monotonic()
+        with pytest.raises((redis_lib.exceptions.ConnectionError, redis_lib.exceptions.TimeoutError)):
+            slots_redis._call_with_retry(lambda: client.get("k"))
+        elapsed = time.monotonic() - start
+    finally:
+        with contextlib.suppress(OSError):
+            server.shutdown(socket.SHUT_RDWR)
+        server.close()
+        for conn in held:
+            conn.close()
+    # The stall is real: two read timeouts, one per attempt. The budget bounds it.
+    assert 2 * slots_redis.DEBRIEF_TIMEOUT_S - 0.5 <= elapsed <= agent.DEBRIEF_CALL_WORST_S
 
 
 def test_command_for_a_different_machine_is_never_picked_up(redis_port, flush_redis, monkeypatch):
@@ -367,6 +599,57 @@ def test_double_claim_only_runs_once(redis_port, flush_redis, monkeypatch):
     assert final["state"] == "ok"
 
 
+class _ReplyLostOnce:
+    # Wraps a redis client. The first claim (SET NX on the result key)
+    # applies on the server. Its reply is then lost as a timeout.
+    def __init__(self, client, res_key):
+        self._client = client
+        self._res_key = res_key
+        self.lost = False
+
+    def set(self, name, value, *args, **kwargs):
+        applied = self._client.set(name, value, *args, **kwargs)
+        if not self.lost and name == self._res_key and kwargs.get("nx"):
+            self.lost = True
+            raise redis_lib.exceptions.TimeoutError("reply lost after the claim applied")
+        return applied
+
+    def __getattr__(self, attr):
+        return getattr(self._client, attr)
+
+
+def test_claim_whose_reply_was_lost_still_runs_once(redis_port, flush_redis, monkeypatch):
+    kw = {"redis_host": "127.0.0.1", "redis_port": redis_port}
+    cmd_id = commands.enqueue("jesus", "loop.stop", {"repo": "lupin"}, key=KEY, **ACTOR_KW, **kw)
+    wrapper = _ReplyLostOnce(agent.debrief_client("127.0.0.1", redis_port), commands.res_key(cmd_id))
+    monkeypatch.setattr(agent, "debrief_client", lambda *_args, **_kwargs: wrapper)
+    fake = _fake_run(returncode=0)
+    monkeypatch.setattr(agent.subprocess, "run", fake)
+
+    touched = agent.poll_once("jesus", KEY, **kw)
+
+    assert wrapper.lost
+    assert len(fake.calls) == 1
+    assert touched == [{"id": cmd_id, "state": "ok"}]
+    assert commands.get_status(cmd_id, **kw)["state"] == "ok"
+
+
+def test_claim_held_by_another_token_is_lost_race_and_not_run(redis_port, flush_redis, monkeypatch):
+    kw = {"redis_host": "127.0.0.1", "redis_port": redis_port}
+    cmd_id = commands.enqueue("jesus", "loop.stop", {"repo": "lupin"}, key=KEY, **ACTOR_KW, **kw)
+    raw = redis_lib.Redis(host="127.0.0.1", port=redis_port, decode_responses=True)
+    raw.set(commands.res_key(cmd_id), json.dumps({"id": cmd_id, "state": "running", "claim": "another-process"}))
+    fake = _fake_run(returncode=0)
+    monkeypatch.setattr(agent.subprocess, "run", fake)
+
+    result = agent._process_one(
+        agent._client("127.0.0.1", redis_port), agent.debrief_client("127.0.0.1", redis_port), "jesus", KEY, cmd_id
+    )
+
+    assert result == {"id": cmd_id, "state": "lost-race"}
+    assert fake.calls == []
+
+
 def test_startup_scan_marks_orphaned_running_entry_as_failed(redis_port, flush_redis, monkeypatch):
     kw = {"redis_host": "127.0.0.1", "redis_port": redis_port}
     cmd_id = commands.enqueue("jesus", "loop.stop", {"repo": "lupin"}, key=KEY, **ACTOR_KW, **kw)
@@ -408,6 +691,62 @@ def test_startup_scan_ignores_running_entries_for_other_machines(redis_port, flu
     assert marked == []
     status = commands.get_status(cmd_id, **kw)
     assert status["state"] == "running"
+
+
+def test_run_forever_polls_while_a_periodic_check_is_slow(monkeypatch):
+    class Stop(Exception):
+        pass
+
+    started = threading.Event()
+    finished = threading.Event()
+    release = threading.Event()
+    polls = []
+    seen = []
+
+    def slow_check():
+        started.set()
+        release.wait(10)
+        finished.set()
+
+    def poll_once(machine, key, **kwargs):
+        polls.append(machine)
+        if len(polls) == 3:
+            # The check must be running now. Polls do not wait for it.
+            seen.append(started.wait(10) and not finished.is_set())
+            raise Stop()
+        return []
+
+    monkeypatch.setattr(agent, "startup_scan", lambda machine, **kwargs: [])
+    monkeypatch.setattr(agent, "poll_once", poll_once)
+    monkeypatch.setattr(loop_runtime, "write_due_periodic_debriefs", slow_check)
+
+    try:
+        with pytest.raises(Stop):
+            agent.run_forever("jesus", KEY, poll_interval=0)
+    finally:
+        release.set()
+
+    assert len(polls) == 3
+    assert seen == [True]
+
+
+def test_periodic_check_failure_does_not_stop_the_loop(capsys):
+    class Stop(BaseException):
+        pass
+
+    calls = []
+
+    def check():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("boom")
+        raise Stop()
+
+    with pytest.raises(Stop):
+        agent._run_periodic_debriefs(check, 0)
+
+    assert len(calls) == 2
+    assert "lupin agent: periodic debrief check failed: boom" in capsys.readouterr().err
 
 
 def test_poll_once_unreachable_redis_raises(closed_port):

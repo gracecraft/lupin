@@ -58,7 +58,7 @@ import time
 from pathlib import Path
 
 import redis
-from redis.backoff import ExponentialWithJitterBackoff
+from redis.backoff import ExponentialWithJitterBackoff, NoBackoff
 from redis.retry import Retry
 
 from . import slots as local_slots
@@ -93,6 +93,8 @@ FLEET_PASSWORD_SETTING = (
 FLEET_USER_SETTING = "--redis-username, LUPIN_REDIS_USERNAME, or the lupin join config"
 
 CONNECT_TIMEOUT = 2.0
+# Timeout for each connect and each read on the debrief path. See debrief_client.
+DEBRIEF_TIMEOUT_S = 1.0
 
 # KEYS[1] = slot:<name>, ARGV[1] = holder, ARGV[2] = now_ms, ARGV[3] = ttl_ms,
 # ARGV[4] = max holders. Returns 1 (added or renewed) or 0 (busy).
@@ -165,6 +167,30 @@ def _client(
         decode_responses=True,
         # Same backoff and count as redis-py's default Retry.
         retry=_RetryUnlessRefused(ExponentialWithJitterBackoff(base=0.01, cap=1), retries=10),
+    )
+
+
+def debrief_client(
+    redis_host: str | None,
+    redis_port: int | None,
+    redis_username: str | None = None,
+    redis_password: str | None = None,
+) -> "redis.Redis":
+    """Client for the debrief path and the agent's stop-command calls.
+
+    Each connect and each read waits up to DEBRIEF_TIMEOUT_S. redis-py
+    does not retry here (retries=0). `_call_with_retry` gives the one retry.
+    The worst case per call is in agent.DEBRIEF_CALL_WORST_S.
+    """
+    return redis.Redis(
+        host=redis_host or "localhost",
+        port=redis_port or 6379,
+        username=redis_username,
+        password=redis_password,
+        socket_connect_timeout=DEBRIEF_TIMEOUT_S,
+        socket_timeout=DEBRIEF_TIMEOUT_S,
+        retry=Retry(NoBackoff(), 0),
+        decode_responses=True,
     )
 
 

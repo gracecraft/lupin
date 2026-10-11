@@ -4,6 +4,7 @@ import io
 import socket
 import sys
 import threading
+import urllib.error
 import urllib.request
 
 import ipaddress
@@ -16,6 +17,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from importlib import resources
 from unittest import mock
+from urllib.parse import quote
 
 import pytest
 import redis as redis_lib
@@ -3627,6 +3629,175 @@ class TestReposPageIntegration:
             handler.do_GET()
         body = handler.reply.call_args.args[0].decode()
         assert "<span class=mono>5</span>" in body
+
+
+DEBRIEF_ATTACHMENT = "11111111-2222-3333-4444-555555555555"
+DEBRIEF_TEXT = (
+    "# Debrief: acme/widgets\n"
+    "## Shipped\n"
+    "- PR #11: Shipped feature <b>x</b>\n"
+    f"- Issue #5: ![shot](https://github.com/user-attachments/assets/{DEBRIEF_ATTACHMENT})\n"
+)
+
+
+def _write_debrief_file(root, repo, name, text):
+    folder = root / "debriefs" / repo
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / name).write_text(text, encoding="utf-8")
+
+
+def test_debrief_index_lists_newest_first_with_utc_file_name_times(tmp_path, monkeypatch):
+    monkeypatch.setattr(serve, "STATE_DIR", str(tmp_path))
+    _write_debrief_file(tmp_path, "widgets", "20261001-090000.md", "# old\n")
+    _write_debrief_file(tmp_path, "widgets", "20261002-090000.md", "# new\n")
+
+    handler = _get_handler("/debrief", {})
+    handler.do_GET()
+
+    body = handler.reply.call_args.args[0].decode()
+    assert "href='/debrief?repo=widgets&amp;file=20261002-090000.md'" in body
+    assert "2026-10-02 09:00:00 UTC" in body
+    assert body.index("20261002-090000") < body.index("20261001-090000")
+
+
+def test_debrief_index_shows_the_period_of_a_periodic_debrief(tmp_path, monkeypatch):
+    monkeypatch.setattr(serve, "STATE_DIR", str(tmp_path))
+    _write_debrief_file(tmp_path, "widgets", "20261002-090000-6h.md", "# six\n")
+
+    handler = _get_handler("/debrief", {})
+    handler.do_GET()
+
+    body = handler.reply.call_args.args[0].decode()
+    assert "2026-10-02 09:00:00 UTC -6h" in body
+
+
+def test_debrief_index_says_when_there_are_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(serve, "STATE_DIR", str(tmp_path))
+
+    handler = _get_handler("/debrief", {})
+    handler.do_GET()
+
+    assert b"No debriefs yet." in handler.reply.call_args.args[0]
+
+
+def test_debrief_page_renders_markdown_escapes_text_and_maps_images(tmp_path, monkeypatch):
+    monkeypatch.setattr(serve, "STATE_DIR", str(tmp_path))
+    _write_debrief_file(tmp_path, "widgets", "20261002-090000.md", DEBRIEF_TEXT)
+
+    handler = _get_handler("/debrief?repo=widgets&file=20261002-090000.md", {})
+    handler.do_GET()
+
+    body = handler.reply.call_args.args[0].decode()
+    assert "<h1>Debrief: acme/widgets</h1>" in body
+    assert "<li>PR #11: Shipped feature &lt;b&gt;x&lt;/b&gt;</li>" in body
+    assert f"<img src='/image?id={DEBRIEF_ATTACHMENT}'" in body
+
+
+@pytest.mark.parametrize("query", [
+    "repo=nope&file=20261002-090000.md",
+    "repo=widgets&file=../../etc/passwd",
+    "repo=widgets&file=notes.md",
+])
+def test_debrief_page_refuses_unknown_or_bad_names_with_404(tmp_path, monkeypatch, query):
+    monkeypatch.setattr(serve, "STATE_DIR", str(tmp_path))
+    _write_debrief_file(tmp_path, "widgets", "20261002-090000.md", DEBRIEF_TEXT)
+
+    handler = _get_handler(f"/debrief?{query}", {})
+    handler.do_GET()
+
+    body, status = handler.reply.call_args.args
+    assert status == 404
+    assert b"no such debrief" in body
+
+
+def test_evidence_route_serves_a_repo_image_over_http(tmp_path, monkeypatch):
+    monkeypatch.setattr(serve, "CODE_DIR", str(tmp_path))
+    (tmp_path / "widgets" / "docs").mkdir(parents=True)
+    (tmp_path / "widgets" / "docs" / "shot.png").write_bytes(b"\x89PNG-test")
+
+    with (
+        mock.patch.object(serve, "enabled_repos", return_value=["widgets"]),
+        _live_dashboard({}) as port,
+    ):
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/evidence?repo=widgets&path=docs/shot.png", timeout=15
+        ) as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Type"] == "image/png"
+            assert resp.headers["Content-Security-Policy"] == "default-src 'none'; sandbox"
+            assert resp.headers["X-Content-Type-Options"] == "nosniff"
+            assert resp.read() == b"\x89PNG-test"
+
+
+@pytest.mark.parametrize("query", [
+    "repo=widgets&path=docs/../shot.png",
+    "repo=widgets&path=/etc/passwd.png",
+    "repo=widgets&path=src/shot.png",
+    "repo=widgets&path=docs/shot.svg",
+    "repo=other&path=docs/shot.png",
+    "repo=../widgets&path=docs/shot.png",
+    "repo=widgets",
+])
+def test_evidence_route_refuses_with_404_over_http(tmp_path, monkeypatch, query):
+    monkeypatch.setattr(serve, "CODE_DIR", str(tmp_path))
+    (tmp_path / "widgets" / "docs").mkdir(parents=True)
+    (tmp_path / "widgets" / "docs" / "shot.png").write_bytes(b"\x89PNG-test")
+    (tmp_path / "widgets" / "docs" / "shot.svg").write_bytes(b"<svg/>")
+    (tmp_path / "widgets" / "shot.png").write_bytes(b"\x89PNG-test")
+    (tmp_path / "widgets" / "src").mkdir()
+    (tmp_path / "widgets" / "src" / "shot.png").write_bytes(b"\x89PNG-test")
+
+    with (
+        mock.patch.object(serve, "enabled_repos", return_value=["widgets"]),
+        _live_dashboard({}) as port,
+    ):
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/evidence?{query}", timeout=15)
+
+    assert refused.value.code == 404
+
+
+DEBRIEF_SHOT_REL = "20261010-120000-6h-screenshots/debrief.png"
+
+
+def test_debrief_shot_route_serves_a_screenshot_over_http(tmp_path, monkeypatch):
+    monkeypatch.setattr(serve, "STATE_DIR", str(tmp_path))
+    shots = tmp_path / "debriefs" / "widgets" / "20261010-120000-6h-screenshots"
+    shots.mkdir(parents=True)
+    (shots / "debrief.png").write_bytes(b"\x89PNG-test")
+
+    with _live_dashboard({}) as port:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/debrief/shot?repo=widgets&path={quote(DEBRIEF_SHOT_REL, safe='')}",
+            timeout=15,
+        ) as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Type"] == "image/png"
+            assert resp.headers["Content-Security-Policy"] == "default-src 'none'; sandbox"
+            assert resp.read() == b"\x89PNG-test"
+
+
+@pytest.mark.parametrize("rel", [
+    "20261010-120000-6h-screenshots/../../../secret.png",
+    "../../secret.png",
+    "/etc/passwd.png",
+    "20261010-120000-6h-screenshots/missing.png",
+])
+def test_debrief_shot_route_refuses_with_404_over_http(tmp_path, monkeypatch, rel):
+    monkeypatch.setattr(serve, "STATE_DIR", str(tmp_path))
+    shots = tmp_path / "debriefs" / "widgets" / "20261010-120000-6h-screenshots"
+    shots.mkdir(parents=True)
+    (shots / "debrief.png").write_bytes(b"\x89PNG-test")
+    (tmp_path / "secret.png").write_bytes(b"\x89PNG-secret")
+
+    with _live_dashboard({}) as port:
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/debrief/shot?repo=widgets&path={quote(rel, safe='')}",
+                timeout=15,
+            )
+
+    assert refused.value.code == 404
 
 
 if __name__ == "__main__":

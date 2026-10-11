@@ -371,8 +371,184 @@ fixed action table: `loop.stop`, `loop.run`, `loop.run-all`, `loop.peek`,
 `schedule.resume`.
 
 `loop.stop` takes `repo` and an optional boolean `force`. Without `force`, the
-stop asks the agent for a handoff first, so the agent allows `loop.stop` 900
-seconds to run. Other actions get 120 seconds.
+stop asks the agent for a handoff first.
+
+The agent gives `loop.stop` a budget of 1740 seconds (29 minutes). This is
+`ACTION_TIMEOUT_S["loop.stop"]` in `agent.py`. The budget is a sum of worst
+cases. No single timer enforces it. It has three parts:
+
+- The command read. The agent reads the command with `_client`. The action is
+  not known until the read ends. So every action uses `_client` for this read.
+- Up to five Redis calls come after the read. They use `debrief_client`.
+  They run in this order:
+  - Claim the command.
+  - Read the claim entry again. This runs only when the claim returns nil.
+  - Write the result.
+  - Remove the command from the queue.
+  - Write the audit line.
+
+  A nil reply means the key already exists. The key can hold this attempt's
+  claim. This happens after a lost reply. It can also hold another poller's
+  claim. The entry is this attempt's claim only when `state` is `running` and
+  `claim` matches this attempt's token. The budget counts five calls. It covers
+  the claim read even when that read does not run.
+- The stop subprocess. Its timer is `SUBPROCESS_TIMEOUT_S["loop.stop"]`, passed
+  to `subprocess.run`.
+
+The subprocess timer is the budget minus the worst case for the other two
+parts:
+
+    COMMAND_READ_WORST_S = 328 seconds
+    SUBPROCESS_TIMEOUT_S = 1740 - 328 - 5 x 14 = 1342 seconds
+
+The budget does not cover the prune read, the pending-list read, or earlier
+commands in the same poll. See known limits.
+
+Other actions get `EXEC_TIMEOUT_S`, which is 120 seconds.
+
+## Redis clients
+
+`slots_redis.debrief_client` makes a Redis client with short timeouts. The stop
+path uses it for the calls after the read. The debrief uses it for its three
+Redis calls.
+
+The client has these settings:
+
+- Each connect waits up to 1 second. This is `DEBRIEF_TIMEOUT_S`.
+- Each read waits up to 1 second.
+- redis-py does not retry (`retries=0`).
+- `_call_with_retry` makes at most two attempts.
+
+`_client` is the default client. Its timeout is 2 seconds. redis-py retries a
+failed command 10 times. The command read uses `_client`. The other callers also
+use `_client`, such as slots, claims, and the ledger.
+
+## One debrief_client call
+
+The worst case is 14 seconds. This is `DEBRIEF_CALL_WORST_S` in `agent.py`:
+
+    2 x (2 + 5) x 1 = 14
+
+- Two attempts (`_call_with_retry`).
+- Each attempt opens a new connection. It waits for one connect per address.
+  `localhost` has two addresses, IPv6 and IPv4.
+- Each attempt then makes five round trips. Each round trip is one request and
+  one reply. The five are: `HELLO 3`, `CLIENT MAINT_NOTIFICATIONS ON`,
+  `CLIENT SETINFO LIB-NAME`, `CLIENT SETINFO LIB-VER`, and the command.
+  The test `test_command_takes_five_round_trips` counts them on the wire.
+- Each wait is up to 1 second.
+
+## The command read
+
+The worst case is 328 seconds. This is `COMMAND_READ_WORST_S` in `agent.py`:
+
+    2 x (11 x (2 + 5) x 2 + 10 x DEFAULT_CLIENT_BACKOFF_CAP_S) = 328
+
+- Two attempts (`_call_with_retry`).
+- Each attempt makes 11 tries. That is one try, then 10 redis-py retries.
+- Each try waits for one connect per address. Then it waits for five round
+  trips. Each wait is up to `CONNECT_TIMEOUT`, which is 2 seconds.
+- Before each retry, the client waits up to `DEFAULT_CLIENT_BACKOFF_CAP_S`.
+  That is the redis-py backoff cap.
+
+This is the worst case, not a measured time.
+
+## Debrief in the subprocess
+
+The debrief runs inside the stop subprocess, after the repo lock is released.
+The debrief has these waits:
+
+- All `gh` calls share one time limit of 10 seconds (`DEBRIEF_TIME_LIMIT_S`).
+  A call that hits the limit leaves a `Not collected` note in the debrief.
+- Three Redis calls, each up to 14 seconds (`DEBRIEF_CALL_WORST_S`):
+  - A ledger read (one `XRANGE`).
+  - A claims scan (`SCAN`). See known limits.
+  - A claims read. This is one batch of `GET` commands. The client sends them
+    together and gets one reply. It is not `MGET`. `MGET` returns nothing for a
+    key of the wrong type. So that claim would vanish. A `GET` batch raises the
+    error.
+
+The debrief client gets no host, port, or password from its caller. It connects
+to `localhost:6379` without auth. Issue #118 tracks this.
+
+Periodic debriefs run on a background thread of `lupin agent`, not in the stop
+subprocess. They do not block commands. They read the same Redis keys as stop
+debriefs. They add no new keys. Their file names end in `-6h`, `-24h`, or
+`-7d`. They have no time budget entry. The "Budget result" section and the
+"Lock waits" section cover stop debriefs only. They connect to `localhost:6379`
+without auth, as stop debriefs do (issue #118).
+Each one also saves two screenshots in a folder named `<file name>-screenshots/`.
+A screenshot uses a headless browser and starts a dashboard on a free port. It
+has no time budget entry. A failed screenshot does not stop the debrief.
+
+## Lock waits
+
+Two lock waits have no time limit of their own. They are not in the budget table.
+
+- The repo lock in `stop_loop` (`loop_runtime.py:1112`, blocking `flock`).
+- The machine lock in `_ensure_shared_server` (`loop_runtime.py:771`, blocking
+  `flock`). The stop path reaches it only when the shared Herdr server is down.
+
+Both waits run inside the stop subprocess. Only the subprocess limit ends them.
+If a wait reaches that limit, the stop ends. The debrief is then not written.
+
+## Known limits
+
+- The budget does not cover the prune read, the pending-list read, or earlier
+  commands in the same poll. These run before the command read.
+- The stop claim uses `debrief_client`. A read that waits more than 1 second
+  makes an attempt fail. Then `_call_with_retry` makes one more attempt. This
+  leads to three cases:
+  - The first try writes the claim. Its reply is lost. The retry returns nil.
+    The claim read finds this attempt's claim token. The stop runs once.
+  - The claim is written. Its reply is lost. The retry or the claim read then
+    fails. The stop does not run. The command stays queued. The record stays
+    `running`. `lupin agent` exits with code 3. The next start marks the record
+    `failed`. It also removes the command from the queue (`startup_scan`).
+  - Another poller claims the id first. This poller returns `lost-race`. It does
+    not touch the queue or run the command.
+- Non-stop actions use `_client`. It allows 2 seconds per read. This limit does
+  not affect them. The test `test_non_stop_command_survives_a_reply_slower_than_the_stop_bound`
+  checks this.
+- If the stop runs, but the result write fails, the record stays `running`
+  until the next start. The next start marks it `failed`. Its reason starts with
+  `orphaned`. So a stop that ran can show `failed`. The test
+  `test_stop_result_write_failure_leaves_the_claim_until_restart` checks this.
+- A `ZREM` after a run can fail with a connection or timeout error. This error
+  ends the poll. `lupin agent` exits with code 3. The entry stays queued.
+  `cmdres` holds the final state. `cmdlog` has no line for the run. When a poll
+  reaches the entry after a restart, it does this:
+  - Before `expires_at` + 30 seconds, it returns `lost-race`. It does not run
+    the command.
+  - From `expires_at` + 30 seconds on, it returns `expired`. It logs an
+    `expired` line with reason `ttl` to `cmdlog`. `cmdres` still says `ok`.
+- The claims scan counts as one request and reply. `SCAN` returns keys in pages.
+  Each extra page is one more request and reply. The budget does not count the
+  extra pages.
+- A server that sends data slowly can keep one reply going. Each read on
+  `debrief_client` waits up to 1 second. For `loop.stop`, these are the calls
+  after the command read. Each read on `_client` waits up to 2 seconds. The
+  command read uses `_client`. The reply as a whole has no time limit. The
+  budget does not bound this case.
+- Name lookup (`getaddrinfo`) is not covered by the timeouts.
+
+## Budget result
+
+Worst case, in seconds. The terms are in `tests/test_agent.py`.
+
+| Part | Terms | Seconds |
+| --- | --- | --- |
+| Subprocess, listed | loop_runtime waits 983.25 plus gh 10 plus three debrief Redis calls 3 x 14 | 1035.25 |
+| Subprocess timer | 1740 - 328 - 5 x 14 | 1342.00 |
+| Agent Redis calls | command read 328 plus five calls at 14 | 398.00 |
+| Listed total | 1035.25 + 398 | 1433.25 |
+| Budget | `ACTION_TIMEOUT_S["loop.stop"]` | 1740.00 |
+| Margin | 1740 - 1433.25 | 306.75 |
+
+The test `test_stop_time_limit_covers_the_listed_timeouts` checks the listed
+total against the budget. The test
+`test_stop_subprocess_cap_leaves_room_for_agent_redis_calls` checks the
+subprocess timer.
 
 ### `cmd:<id>`
 
@@ -390,7 +566,7 @@ allowance.
   "id": "a1b2c3d4e5f6...",
   "target": "jesus",
   "action": "loop.stop",
-  "params": {"repo": "gracecraft/lupin"},
+  "params": {"repo": "lupin"},
   "actor": "grace",
   "issuer": "pihome",
   "issued_at": 1759708800.123,
@@ -408,26 +584,49 @@ so a compromised host can't forge a command for a different one.
 
 ### `cmdres:<id>`
 
-Claimed with `SET ... NX` (first writer wins a race between two pollers
-on the same id), then overwritten by the same claimant with the final
-result. `state` is one of `queued` (no `cmdres` yet — the `cmd:<id>` key
-is the only record), `running`, `ok`, `failed`, `rejected`, `expired`.
+Claimed with `SET ... NX`. The first writer wins a race between two pollers
+on the same id. The poller that made the claim then overwrites it with the
+final result.
+
+`state` is one of `queued`, `running`, `ok`, `failed`, `rejected`, `expired`.
+A `queued` entry has no `cmdres` yet. Only its `cmd:<id>` key exists.
+
+A `running` entry has a `claim` field. It holds a new token for each claim
+attempt. If `SET ... NX` returns nil, the poller reads the entry again. The
+claim belongs to this attempt when `claim` matches its token and `state` is
+`running`. Otherwise, another poller holds the claim, or a result exists.
 
 ```json
 {"id": "a1b2c3d4e5f6...", "state": "ok", "host": "jesus", "action": "loop.stop", "exit_code": 0, "output": "...", "truncated": false}
 ```
 
-A `running` entry still present when `lupin agent` restarts means the
-previous process crashed mid-command — the startup scan marks it `failed`
-rather than silently re-running it. `output` is the last 8 KiB of combined
-stdout+stderr; `rejected`/`failed`-without-a-run carry a `reason` string
-instead.
+A `running` entry that is still queued when `lupin agent` restarts is marked
+`failed`. Its reason is `orphaned: still running when the agent restarted`. The
+startup scan does this. It never runs the command again.
+Three cases can leave such an entry for any action:
+
+- The agent process stopped after it wrote the claim, and before it wrote the
+  result. A crash or a kill can cause this. The command can have run in
+  full, in part, or not at all. The startup scan does not check whether the
+  command ran.
+- The claim was written, but its reply was lost. The retry or the claim read
+  then failed. The command did not run. The agent exited with code 3.
+- The command ran, but the result write failed. The agent exited with code 3.
+  The command did run.
+
+`output` is the last 8 KiB of combined stdout+stderr. `rejected` entries and
+`failed` entries without a run carry a `reason` string instead.
 
 ### `cmdlog`
 
-One stream entry per enqueue and one per terminal outcome
-(`ok`/`failed`/`rejected`/`expired`) — the audit trail, capped with
-`MAXLEN ~ 2000`.
+The stream has one entry for each enqueue. It has one entry for each terminal
+outcome (`ok`/`failed`/`rejected`/`expired`). The stream is capped with
+`MAXLEN ~ 2000`. This is the audit trail. Some outcomes have no line:
+
+- A Redis connection or timeout error on the write drops the line.
+- A run whose `ZREM` fails has no line. If a later poll expires the entry,
+  and its ZREM succeeds, that poll writes an `expired` line. `cmdres` still
+  says `ok`. If the prune removes the entry first, no line is written.
 
 ## TTLs
 

@@ -102,6 +102,77 @@ def test_claims_for_only_returns_repos_asked_for(redis_port, flush_redis):
     assert set(result) == {"gracecraft/lupin#6"}
 
 
+def test_claims_for_raises_when_a_claim_key_has_the_wrong_type(redis_port, flush_redis):
+    kw = {"redis_host": "127.0.0.1", "redis_port": redis_port}
+    raw = redis_lib.Redis(host="127.0.0.1", port=redis_port, decode_responses=True)
+    raw.rpush("lupin:v1:claim:gracecraft/lupin#6", "not a claim")
+
+    # A wrong-type key is a bug, not an empty claim. It must raise, not vanish.
+    with pytest.raises(redis_lib.exceptions.ResponseError):
+        claims.claims_for(["gracecraft/lupin"], **kw)
+
+
+def test_claims_for_skips_a_claim_that_expired_after_the_scan(redis_port, flush_redis, monkeypatch):
+    kw = {"redis_host": "127.0.0.1", "redis_port": redis_port}
+    claims.claim("gracecraft/lupin#6", "holder-a", **kw)
+    claims.claim("gracecraft/lupin#7", "holder-b", **kw)
+    real = redis_lib.Redis(host="127.0.0.1", port=redis_port, decode_responses=True)
+
+    class ExpireAfterScan:
+        """Scans as usual, then deletes #6 before the read, as if its TTL ran out."""
+
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def scan_iter(self, *args, **kwargs):
+            keys = list(real.scan_iter(*args, **kwargs))
+            real.delete("lupin:v1:claim:gracecraft/lupin#6")
+            return iter(keys)
+
+    monkeypatch.setattr(claims, "_client", lambda *_args: ExpireAfterScan())
+
+    result = claims.claims_for(["gracecraft/lupin"], **kw)
+
+    assert set(result) == {"gracecraft/lupin#7"}
+
+
+def test_claims_for_retry_reads_every_key(redis_port, flush_redis, monkeypatch):
+    kw = {"redis_host": "127.0.0.1", "redis_port": redis_port}
+    claims.claim("gracecraft/lupin#6", "holder-a", **kw)
+    claims.claim("gracecraft/lupin#7", "holder-b", **kw)
+    real = redis_lib.Redis(host="127.0.0.1", port=redis_port, decode_responses=True)
+    dropped = []
+
+    class DropFirstExecute:
+        """Runs the first pipeline, then drops the reply as if the link broke."""
+
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def pipeline(self, **kwargs):
+            pipe = real.pipeline(**kwargs)
+
+            class Pipe:
+                def __getattr__(self, name):
+                    return getattr(pipe, name)
+
+                def execute(self, *args, **kwargs):
+                    replies = pipe.execute(*args, **kwargs)
+                    if not dropped:
+                        dropped.append(True)
+                        raise redis_lib.exceptions.ConnectionError("reply lost")
+                    return replies
+
+            return Pipe()
+
+    monkeypatch.setattr(claims, "_client", lambda *_args: DropFirstExecute())
+
+    result = claims.claims_for(["gracecraft/lupin"], **kw)
+
+    assert dropped == [True]
+    assert set(result) == {"gracecraft/lupin#6", "gracecraft/lupin#7"}
+
+
 def test_unreachable_redis_raises_for_every_claim_call(closed_port):
     kw = {"redis_host": "127.0.0.1", "redis_port": closed_port}
     with pytest.raises(slots.CoordinatorUnreachable):

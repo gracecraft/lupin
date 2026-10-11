@@ -24,7 +24,8 @@
           doCheck = false;
           # `lupin serve` shells out to these fixed read-only probes and
           # runs them from PATH, so they belong on the wrapper's PATH.
-          # `systemd` is Linux-only and this flake builds for darwin too.
+          # `systemd` and `chromium` are Linux-only and this flake builds for darwin too.
+          # `chromium` takes the periodic debrief screenshots.
           # `omp` is deliberately absent: it is not in nixpkgs. The caller
           # puts it on PATH (ghostbook.nix's ai-skills-claude module ships
           # it), and the usage page already reports a row as unavailable
@@ -39,7 +40,7 @@
                 pkgs.git
                 pkgs.tmux
               ]
-              ++ nixpkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.systemd ]
+              ++ nixpkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.systemd pkgs.chromium ]
             ))
           ];
           meta = {

@@ -38,20 +38,53 @@ import json
 import re
 import shutil
 import subprocess
+import sys
+import threading
 import time
+import uuid
+from collections.abc import Callable
 
 import redis
 
-from . import commands, machines
+from . import commands, loop_runtime, machines
 from .slots import CoordinatorUnreachable
-from .slots_redis import _call_with_retry, _client
+from .slots_redis import CONNECT_TIMEOUT, DEBRIEF_TIMEOUT_S, _call_with_retry, _client, debrief_client
 
 DEFAULT_BATCH = 20  # design: "ZRANGE the oldest 20"
 DEFAULT_POLL_INTERVAL = 2.0
+PERIODIC_CHECK_S = 300.0  # Seconds between checks for due periodic debriefs.
 EXEC_TIMEOUT_S = 120.0
-# A stop that asks the agent for a handoff waits up to loop_runtime.HANDOFF_GRACE_S
-# (600s) for it, so it gets more time than other actions.
-ACTION_TIMEOUT_S = {"loop.stop": 900.0}
+# Budget for loop.stop, in seconds. The stop subprocess gets what is left
+# after the command read and the Redis calls after it. See docs/redis-schema.md.
+ACTION_TIMEOUT_S = {"loop.stop": 1740.0}
+REDIS_ADDRESSES = 2  # IPv6 and IPv4 for localhost
+# One command on a new connection takes five Redis requests. The client
+# first sends HELLO 3, CLIENT MAINT_NOTIFICATIONS ON, CLIENT SETINFO
+# LIB-NAME, and CLIENT SETINFO LIB-VER. Then it sends the command.
+# The test test_command_takes_five_round_trips checks this.
+REDIS_ROUND_TRIPS = 5
+ATTEMPTS_PER_CALL = 2  # _call_with_retry makes two attempts
+# Worst case for one debrief_client call, in seconds. Each attempt waits
+# for one connect per address, then for each round trip. Each wait is up to DEBRIEF_TIMEOUT_S.
+DEBRIEF_CALL_WORST_S = ATTEMPTS_PER_CALL * (REDIS_ADDRESSES + REDIS_ROUND_TRIPS) * DEBRIEF_TIMEOUT_S
+# Worst case for the command read, in seconds. The read uses _client, with
+# redis-py's default of 10 retries and a backoff of up to 1 s between tries.
+# Each try waits for one connect per address and for each round trip. Each
+# wait is up to CONNECT_TIMEOUT.
+DEFAULT_CLIENT_RETRIES = 10
+DEFAULT_CLIENT_BACKOFF_CAP_S = 1.0
+COMMAND_READ_WORST_S = ATTEMPTS_PER_CALL * (
+    (DEFAULT_CLIENT_RETRIES + 1) * (REDIS_ADDRESSES + REDIS_ROUND_TRIPS) * CONNECT_TIMEOUT
+    + DEFAULT_CLIENT_RETRIES * DEFAULT_CLIENT_BACKOFF_CAP_S
+)
+# The agent makes up to five Redis calls on the loop.stop path after the read.
+# The calls are: claim, claim read, write result, dequeue, and audit line.
+# The claim read runs only when the claim returns nil. They use debrief_client.
+AGENT_REDIS_CALLS_ON_STOP = 5
+# Cap on the stop subprocess. The read and the agent's Redis calls use the rest of the limit.
+SUBPROCESS_TIMEOUT_S = {
+    "loop.stop": ACTION_TIMEOUT_S["loop.stop"] - COMMAND_READ_WORST_S - AGENT_REDIS_CALLS_ON_STOP * DEBRIEF_CALL_WORST_S,
+}
 OUTPUT_CAP = 8192  # 8 KiB, combined stdout+stderr -- design's "last 8 KiB combined"
 
 # Defense in depth: queue commands must pass this strict repo-name check.
@@ -322,7 +355,10 @@ def _mark_expired(client, machine: str, cmd_id: str) -> dict:
     return {"id": cmd_id, "state": "expired"}
 
 
-def _process_one(client, machine: str, key: str, cmd_id: str) -> dict:
+def _process_one(client, stop_client, machine: str, key: str, cmd_id: str) -> dict:
+    # The read uses `client` for every action, because the action is
+    # not known until the command is read. loop.stop has a time limit, so
+    # its later Redis calls use `stop_client`, which is bounded.
     raw = _call_with_retry(lambda: client.get(commands.cmd_key(cmd_id)))
     if raw is None:
         # Gone from Redis already (its own retention TTL, or evicted under
@@ -330,6 +366,8 @@ def _process_one(client, machine: str, key: str, cmd_id: str) -> dict:
         return _mark_expired(client, machine, cmd_id)
     cmd = json.loads(raw)
     action = cmd.get("action")
+    if action == "loop.stop":
+        client = stop_client
 
     if not commands.verify(cmd, key):
         return _reject(client, machine, cmd_id, action, "bad signature")
@@ -353,22 +391,39 @@ def _process_one(client, machine: str, key: str, cmd_id: str) -> dict:
         return _reject(client, machine, cmd_id, action, str(exc))
 
     started_at = time.time()
+    # New for each attempt. After a retry, the poll checks for this token.
+    claim = uuid.uuid4().hex
     claimed = _call_with_retry(
         lambda: client.set(
             commands.res_key(cmd_id),
-            json.dumps({"id": cmd_id, "state": "running", "host": machine, "action": action, "started_at": started_at}),
+            json.dumps(
+                {
+                    "id": cmd_id,
+                    "state": "running",
+                    "host": machine,
+                    "action": action,
+                    "started_at": started_at,
+                    "claim": claim,
+                }
+            ),
             nx=True,
             px=int(commands.RESULT_TTL_S * 1000),
         )
     )
     if not claimed:
-        # Another poller racing on the same id claimed it first. Don't
-        # touch the queue or run anything -- the claimant finishes the
-        # job, including the dequeue.
-        return {"id": cmd_id, "state": "lost-race"}
+        # SET NX returns nil when the key exists. That can be this attempt's
+        # own claim, after a lost reply, or another poller's. The claim token
+        # shows which.
+        raw = _call_with_retry(lambda: client.get(commands.res_key(cmd_id)))
+        held = json.loads(raw) if raw else {}
+        if held.get("state") != "running" or held.get("claim") != claim:
+            # Another poller racing on the same id claimed it first. Do not
+            # touch the queue or run anything. The poller that made the
+            # claim finishes the job, including the dequeue.
+            return {"id": cmd_id, "state": "lost-race"}
 
     try:
-        proc = subprocess.run(argv, shell=False, capture_output=True, text=True, timeout=ACTION_TIMEOUT_S.get(action, EXEC_TIMEOUT_S))
+        proc = subprocess.run(argv, shell=False, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_S.get(action, EXEC_TIMEOUT_S))
         combined = (proc.stdout or "") + (proc.stderr or "")
         payload = {
             "id": cmd_id,
@@ -461,11 +516,25 @@ def poll_once(
         _call_with_retry(lambda: client.zremrangebyscore(qkey, "-inf", cutoff_ms))
 
         pending = _call_with_retry(lambda: client.zrange(qkey, 0, batch - 1))
+        stop_client = debrief_client(redis_host, redis_port, redis_username, redis_password)
         for cmd_id in pending:
-            touched.append(_process_one(client, machine, key, cmd_id))
+            touched.append(_process_one(client, stop_client, machine, key, cmd_id))
     except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as exc:
         raise CoordinatorUnreachable(machine) from exc
     return touched
+
+
+def _run_periodic_debriefs(check: Callable[[], None], interval: float) -> None:
+    """Call `check` now, then every `interval` seconds. Runs on a daemon thread.
+
+    A failed call prints a warning. The loop keeps running.
+    """
+    while True:
+        try:
+            check()
+        except Exception as exc:
+            print(f"lupin agent: periodic debrief check failed: {exc}", file=sys.stderr)
+        time.sleep(interval)
 
 
 def run_forever(
@@ -483,6 +552,12 @@ def run_forever(
     Doesn't return under normal operation."""
     conn = dict(redis_host=redis_host, redis_port=redis_port, redis_username=redis_username, redis_password=redis_password)
     startup_scan(machine, **conn)
+    # Periodic debriefs run on their own thread. A slow debrief does not delay command polls.
+    threading.Thread(
+        target=_run_periodic_debriefs,
+        args=(loop_runtime.write_due_periodic_debriefs, PERIODIC_CHECK_S),
+        daemon=True,
+    ).start()
     while True:
         poll_once(machine, key, batch=batch, **conn)
         time.sleep(poll_interval)

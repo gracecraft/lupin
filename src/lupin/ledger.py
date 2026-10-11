@@ -130,19 +130,23 @@ def read_events(
     redis_port: int | None = None,
     redis_username: str | None = None,
     redis_password: str | None = None,
+    client: "redis.Redis | None" = None,
 ) -> list[dict]:
     """Return the latest `limit` events, oldest first.
 
     `limit` defaults to 10 and must be positive. Pass `None` to read the full
     stream. An empty stream returns an empty list. Raises
-    `CoordinatorUnreachable` when Redis cannot be reached.
+    `CoordinatorUnreachable` when Redis cannot be reached. Pass `client` to
+    use a ready client, as the debrief path does. Without it, a client is made
+    from the connection arguments.
     """
     key = _stream_key(repo)
     if limit is not None and (
         not isinstance(limit, int) or isinstance(limit, bool) or limit < 1
     ):
         raise ValueError("limit must be a positive integer")
-    client = _client(redis_host, redis_port, redis_username, redis_password)
+    if client is None:
+        client = _client(redis_host, redis_port, redis_username, redis_password)
     try:
         if limit is None:
             entries = _call_with_retry(lambda: client.xrange(key))

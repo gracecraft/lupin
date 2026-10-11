@@ -216,33 +216,50 @@ def claims_for(
     redis_port: int | None = None,
     redis_username: str | None = None,
     redis_password: str | None = None,
+    client: "redis.Redis | None" = None,
 ) -> dict[str, dict]:
     """Return `{"<owner>/<repo>#<n>": {"host", "session", "since"}}` for
     every currently-claimed issue in `repos` (each an `"<owner>/<repo>"`
     string, no issue number).
 
-    The integration point future `roadmap` (#10) and `quest` (#11) commands
-    import to find out which of their issues are off-limits -- pass the
-    repos you already know about, get back the claimed subset. Raises
-    `CoordinatorUnreachable` if Redis can't be reached; there's no local
-    fallback for claims, so a caller should treat that failure the same way
-    `lupin claim` exiting 3 is treated elsewhere: start no new issue, but
-    don't disturb anything already in progress.
+    This is the integration point that future `roadmap` (#10) and `quest`
+    (#11) commands import. They use it to find out which of their issues are
+    off-limits. Pass the repos you already know about. The function returns
+    the claimed subset. Raises
+    `CoordinatorUnreachable` if Redis cannot be reached. There is no local
+    fallback for claims. Callers must handle `CoordinatorUnreachable`.
+    Start no new issue. Do not disturb anything
+    already in progress. Pass `client` to use a ready client, as the debrief
+    path does. Without it, a client is made from the connection arguments.
     """
-    client = _client(redis_host, redis_port, redis_username, redis_password)
+    if client is None:
+        client = _client(redis_host, redis_port, redis_username, redis_password)
     prefix = f"{PREFIX}claim:"
     try:
         keys = _call_with_retry(lambda: list(client.scan_iter(match=f"{prefix}*")))
-        result: dict[str, dict] = {}
+        wanted = []
         for key in keys:
             target = key[len(prefix) :]
             owner_repo, _sep, _number = target.rpartition("#")
-            if owner_repo not in repos:
-                continue
-            raw = _call_with_retry(lambda k=key: client.get(k))
+            if owner_repo in repos:
+                wanted.append(key)
+        result: dict[str, dict] = {}
+        if not wanted:
+            return result
+        # One batch of GET commands for all keys, sent together. GET, not MGET,
+        # so a key of the wrong type raises an error. MGET would return None.
+        # The batch is built inside the retry, because execute() clears it.
+        def read_claims():
+            pipe = client.pipeline(transaction=False)
+            for key in wanted:
+                pipe.get(key)
+            return pipe.execute(raise_on_error=True)
+
+        raws = _call_with_retry(read_claims)
+        for key, raw in zip(wanted, raws):
             if raw is None:
-                continue
-            result[target] = json.loads(raw)
+                continue  # expired between the scan and the read
+            result[key[len(prefix) :]] = json.loads(raw)
         return result
     except redis.exceptions.AuthenticationError as exc:
         raise _auth_failed(exc) from exc

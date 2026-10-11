@@ -9,7 +9,7 @@ from unittest import mock
 import pytest
 import redis as redis_lib
 
-from lupin import benchmark_fetch, cli, commands, loop_runtime, loops, machines, slots
+from lupin import agent, benchmark_fetch, cli, commands, loop_runtime, loops, machines, slots
 
 
 @pytest.fixture(autouse=True)
@@ -294,6 +294,18 @@ def test_future_once_without_enabled_repos_does_not_schedule(monkeypatch, tmp_pa
     assert not (tmp_path / "once").exists()
 
 
+def test_loops_unreadable_repos_file_exits_one_without_traceback(monkeypatch, tmp_path: Path, capsys):
+    repos = tmp_path / "repos"
+    repos.write_bytes(b"\xff\n")
+    monkeypatch.setattr(loop_runtime, "REPOS_FILE", repos)
+
+    assert cli.main(["loops"]) == 1
+
+    err = capsys.readouterr().err
+    assert f"could not read {repos}" in err
+    assert "Traceback" not in err
+
+
 
 @pytest.mark.parametrize(
     "argv, action, params",
@@ -370,6 +382,31 @@ def test_stop_json_shape(capsys):
     captured = capsys.readouterr()
     assert code == 0
     assert json.loads(captured.out) == {"mode": "local", "returncode": 0, "output": "ok"}
+
+
+def test_local_stop_runs_with_stop_time_limit(monkeypatch):
+    seen = {}
+
+    def fake_run(argv, timeout=20.0):
+        seen["timeout"] = timeout
+        return 0, ""
+
+    monkeypatch.setattr(loops, "run_subprocess", fake_run)
+    code = cli.main(["stop", "widgets", "--machine", "h"])
+    assert code == 0
+    assert seen["timeout"] == agent.ACTION_TIMEOUT_S["loop.stop"]
+
+
+def test_remote_stop_queues_and_skips_local_runner(capsys):
+    with (
+        mock.patch.object(loops, "run_subprocess") as local_runner,
+        mock.patch.object(loops.commands, "enqueue", return_value="cmd-1") as enqueue,
+        mock.patch.object(loops.commands, "get_status", return_value={"state": "ok"}),
+    ):
+        code = cli.main(["stop", "widgets", "--machine", "other", "--signing-key", "k"])
+    assert code == 0
+    assert enqueue.call_args.args[:2] == ("other", "loop.stop")
+    local_runner.assert_not_called()
 
 
 @pytest.mark.parametrize(

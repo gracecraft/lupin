@@ -28,11 +28,12 @@ import urllib.request
 from datetime import datetime, timezone
 from importlib import resources
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse, urlsplit
 
 import redis
 
-from . import benchmark_catalog, benchmark_fetch, claims, commands, loop_runtime, loops, machines, model_fetch, quest, quota_cache, roadmap, slots_redis
+from . import benchmark_catalog, benchmark_fetch, claims, commands, debrief, loop_runtime, loops, machines, model_fetch, quest, quota_cache, roadmap, slots_redis
 from . import usage_cache
 from .slots import CoordinatorUnreachable
 from .quota import (
@@ -2738,6 +2739,28 @@ def render_loop_fullscreen(entry: dict, tail: str | None, lines: int, group: str
     ).encode("utf-8")
 
 
+def render_debrief_index(items: list[tuple[str, str]]) -> bytes:
+    rows = "".join(
+        f"<li><a href='/debrief?repo={quote(repo, safe='')}&amp;file={quote(name, safe='')}'>"
+        f"{esc(repo)}</a> <span class=dim>{esc(_debrief_stamp(name))}</span></li>"
+        for repo, name in items
+    )
+    listing = f"<ul>{rows}</ul>" if rows else "<p class=dim>No debriefs yet.</p>"
+    return page(
+        "Debriefs",
+        f"<header><h1>Debriefs</h1></header><div class=card>{listing}</div>",
+        debrief.CSS,
+    )
+
+
+def _debrief_stamp(name: str) -> str:
+    """`20261010-120000.md` -> `2026-10-10 12:00:00 UTC`. Periodic files keep the suffix. Name is pre-checked."""
+    stamp = name[:15]
+    label = f"{stamp[:4]}-{stamp[4:6]}-{stamp[6:8]} {stamp[9:11]}:{stamp[11:13]}:{stamp[13:15]} UTC"
+    period = name[15:-3]
+    return f"{label} {period}" if period else label
+
+
 def render_error(msg: str) -> bytes:
     return page(
         "error",
@@ -3003,6 +3026,12 @@ class Handler(BaseHTTPRequestHandler):
             self.do_peek(query)
         elif url.path == "/image":
             self.do_image(query)
+        elif url.path == "/debrief":
+            self.do_debrief(query)
+        elif url.path == "/debrief/shot":
+            self.do_debrief_shot(query)
+        elif url.path == "/evidence":
+            self.do_evidence(query)
         elif url.path == "/healthz":
             self.reply(b"ok")
         else:
@@ -3024,6 +3053,71 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         data, content_type = image
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "private, max-age=300")
+        self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_debrief(self, query: dict) -> None:
+        root = Path(STATE_DIR)
+        repo = (query.get("repo") or "").strip()
+        name = (query.get("file") or "").strip()
+        if not repo and not name:
+            self.reply(render_debrief_index(debrief.list_debriefs(root)))
+            return
+        try:
+            markdown = debrief.read_debrief(root, repo, name)
+        except debrief.DebriefError:
+            self.reply(render_error("no such debrief"), 404)
+            return
+        self.reply(
+            page(
+                f"Debrief {repo}",
+                "<header><h1>Debrief</h1><span class=sp></span>"
+                "<a href='/debrief'>all debriefs</a></header>"
+                f"<div class=card><div class=debrief>{debrief.render_html(markdown, repo)}</div></div>",
+                debrief.CSS,
+            )
+        )
+
+    def do_debrief_shot(self, query: dict) -> None:
+        found = debrief.read_screenshot(
+            Path(STATE_DIR), (query.get("repo") or "").strip(), query.get("path") or "",
+        )
+        if found is None:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+        data, content_type = found
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "private, max-age=300")
+        self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_evidence(self, query: dict) -> None:
+        repo = (query.get("repo") or "").strip()
+        found = None
+        if _valid_repo_name(repo) and repo in enabled_repos():
+            found = debrief.read_evidence(Path(CODE_DIR) / repo, query.get("path") or "")
+        if found is None:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+        data, content_type = found
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
