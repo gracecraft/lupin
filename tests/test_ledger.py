@@ -104,6 +104,99 @@ def test_read_of_empty_ledger_returns_no_events(connection):
     assert ledger.read_events("acme/empty", **connection) == []
 
 
+@pytest.mark.parametrize(
+    ("bad_fields", "error_name"),
+    [
+        (
+            {
+                "ts": "2026-10-10T00:00:00Z",
+                "host": "machine-a",
+                "event": "work",
+                "highlights": "not json",
+            },
+            "JSONDecodeError",
+        ),
+        ({"host": "machine-a", "event": "work"}, "KeyError"),
+        ({"ts": "2026-10-10T00:00:00Z", "event": "work"}, "KeyError"),
+        (
+            {
+                "ts": "2026-10-10T00:00:00Z",
+                "host": "machine-a",
+                "event": "work",
+                "issue": "abc",
+            },
+            "ValueError",
+        ),
+        (
+            {
+                "ts": "2026-10-10T00:00:00Z",
+                "host": "machine-a",
+                "event": "work",
+                "highlights": "[" * 100_000 + "]" * 100_000,
+            },
+            "RecursionError",
+        ),
+    ],
+    ids=["bad-json", "missing-ts", "missing-host", "bad-issue", "deep-json"],
+)
+def test_read_skips_bad_entry_and_reports_it_once(
+    connection, capsys, bad_fields, error_name
+):
+    first = ledger.append_event(
+        "acme/repo", {"event": "work", "issue": 1}, **connection
+    )
+    bad_id = ledger._client(**connection).xadd(
+        ledger._stream_key("acme/repo"), bad_fields
+    )
+    last = ledger.append_event("acme/repo", {"event": "work", "issue": 2}, **connection)
+
+    events = ledger.read_events("acme/repo", **connection)
+
+    err = capsys.readouterr().err
+    assert events == [first, last]
+    assert err.count(bad_id) == 1
+    assert f"{error_name}:" in err
+
+
+def test_read_counts_bad_entry_toward_limit(connection, capsys):
+    ledger.append_event("acme/repo", {"event": "work", "issue": 1}, **connection)
+    bad_id = ledger._client(**connection).xadd(
+        ledger._stream_key("acme/repo"),
+        {
+            "ts": "2026-10-10T00:00:00Z",
+            "host": "machine-a",
+            "event": "work",
+            "highlights": "not json",
+        },
+    )
+    last = ledger.append_event("acme/repo", {"event": "work", "issue": 2}, **connection)
+
+    events = ledger.read_events("acme/repo", limit=2, **connection)
+
+    assert events == [last]
+    assert capsys.readouterr().err.count(bad_id) == 1
+
+
+def test_read_skips_non_utf8_entry_and_reports_it_once(connection, capsys):
+    bad_id = ledger._client(**connection).xadd(
+        ledger._stream_key("acme/repo"),
+        {
+            "ts": "2026-10-10T00:00:00Z",
+            "host": "machine-a",
+            "event": "work",
+            "summary": b"\xff\xfe",
+        },
+    )
+    good = ledger.append_event("acme/repo", {"event": "work", "issue": 2}, **connection)
+
+    events = ledger.read_events("acme/repo", **connection)
+
+    err = capsys.readouterr().err
+    assert events == [good]
+    assert err.count(bad_id) == 1
+    assert "UnicodeDecodeError:" in err
+
+
 def test_append_and_read_report_unavailable_coordinator(closed_port):
     connection = {"redis_host": "127.0.0.1", "redis_port": closed_port}
 

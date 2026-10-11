@@ -154,6 +154,8 @@ def _client(
     redis_port: int | None,
     redis_username: str | None = None,
     redis_password: str | None = None,
+    *,
+    decode_responses: bool = True,
 ) -> "redis.Redis":
     return redis.Redis(
         host=redis_host or "localhost",
@@ -162,7 +164,7 @@ def _client(
         password=redis_password,
         socket_connect_timeout=CONNECT_TIMEOUT,
         socket_timeout=CONNECT_TIMEOUT,
-        decode_responses=True,
+        decode_responses=decode_responses,
         # Same backoff and count as redis-py's default Retry.
         retry=_RetryUnlessRefused(ExponentialWithJitterBackoff(base=0.01, cap=1), retries=10),
     )

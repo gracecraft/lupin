@@ -62,10 +62,15 @@ lupin resume [--machine M | --all] [--json]
 
 `ledger append` stores events in Redis. It records the time and host. Repeat
 digest options to add more than one item. Repeat `--child` for each split
-issue. `ledger read --json` returns the latest 10 events, oldest first.
-Use `--limit N` to choose another positive count. Both commands exit 3 if
-Redis is unavailable. The roadmap shows no ledger annotations and a warning.
-It ignores `.loop/loop-state.json`.
+issue. `ledger read --json` returns up to the latest 10 events, oldest first.
+Use `--limit N` to choose another positive count. `_decode` in
+`src/lupin/ledger.py` turns one entry's ID and decoded fields into a dict.
+`read_events` decodes each entry on its own. It skips an entry when a
+field is not valid UTF-8. It also skips an entry when `_decode` raises
+KeyError, ValueError, or RecursionError. It reports each skipped entry on
+stderr. A skipped entry still counts toward the limit. Both commands exit 3
+if Redis is unavailable. When Redis is unavailable, the roadmap shows no
+ledger annotations and a warning. It ignores `.loop/loop-state.json`.
 
 `review-route --prefetch` fetches issue/PR text up front -- body, comments,
 and (for a PR) reviews and a diff stat (changed files, additions/deletions,
