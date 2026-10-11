@@ -92,7 +92,7 @@ def test_is_fresh_uses_the_five_minute_window():
 
 
 def test_quota_command_publishes_quota_and_usage(
-    redis_port, flush_redis, monkeypatch, capsys, tmp_path
+    redis_port, flush_redis, monkeypatch, capsys, tmp_path, clean_lupin_env
 ):
     quota_rows = [{
         "provider": "openai",

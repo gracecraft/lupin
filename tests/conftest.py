@@ -7,6 +7,7 @@ a clean keyspace via `flush_redis` instead of a fresh server.
 
 from __future__ import annotations
 
+import os
 import socket
 import subprocess
 import time
@@ -194,3 +195,21 @@ def make_checkout(tmp_path):
         return path
 
     return make
+
+
+@pytest.fixture(autouse=True)
+def clean_lupin_env(monkeypatch):
+    """Run each test with a clean LUPIN_* environment and the local backend.
+
+    The sandbox shell exports LUPIN_* variables. Without this fixture, a test can reach the shared Redis server.
+
+    Every LUPIN_* variable is deleted, then LUPIN_BACKEND is set to local.
+    Tests that need Redis set their own values after this fixture runs.
+
+    The list is built once, when this fixture runs. Variables set later stay.
+    Modules that read variables at import time keep their values, for example
+    STATE_DIR in loop_runtime.py.
+    """
+    for name in [key for key in os.environ if key.startswith("LUPIN_")]:
+        monkeypatch.delenv(name)
+    monkeypatch.setenv("LUPIN_BACKEND", "local")

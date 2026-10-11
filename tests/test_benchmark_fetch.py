@@ -560,6 +560,25 @@ def test_refresh_releases_lock_even_if_fetch_raises(redis_port, flush_redis):
     assert slots_redis.status(**_kw(redis_port))[benchmark_fetch.LOCK_SLOT]["holders"] == 0
 
 
+def test_refresh_cache_write_failure_is_reported_and_result_kept(redis_port, flush_redis, capsys):
+    fresh = {"fetched_at": benchmark_fetch._now_iso(), "live": True, "source": "test", "scores": [{"id": "x", "score": 1}]}
+    client = redis_lib.Redis(host="127.0.0.1", port=redis_port)
+    client.set = mock.Mock(side_effect=redis_lib.exceptions.ConnectionError("boom"))
+
+    with (
+        mock.patch.object(benchmark_fetch, "_client", return_value=client),
+        mock.patch.object(benchmark_fetch, "fetch_benchmark_scores", return_value=fresh),
+        mock.patch.object(benchmark_fetch, "model_ids_for_scoring", return_value=["x"]),
+    ):
+        result = benchmark_fetch.refresh_snapshot(**_kw(redis_port))
+
+    err = capsys.readouterr().err
+    assert result == fresh
+    assert len(err.splitlines()) == 1
+    assert "not cached" in err and "boom" in err
+    assert slots_redis.status(**_kw(redis_port))[benchmark_fetch.LOCK_SLOT]["holders"] == 0
+
+
 def test_refresh_with_no_models_anywhere_is_unavailable_without_the_lock(redis_port, flush_redis):
     with (
         mock.patch.object(benchmark_fetch, "fetch_benchmark_scores") as fetch,

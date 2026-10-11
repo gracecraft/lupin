@@ -54,7 +54,7 @@ def test_release_is_compare_and_delete(redis_port, flush_redis):
     assert slots_redis.release(real_lease, **kw) is False
 
 
-def test_status_json_matches_real_sorted_set_contents(redis_port, flush_redis, capsys):
+def test_status_json_matches_real_sorted_set_contents(redis_port, flush_redis, capsys, clean_lupin_env):
     common = ["--backend", "redis", "--redis-host", "127.0.0.1", "--redis-port", str(redis_port)]
     cli.main(["acquire", "bmo", "--holder", "a", "--max", "2", *common])
     cli.main(["acquire", "bmo", "--holder", "b", *common])

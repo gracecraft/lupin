@@ -20,7 +20,7 @@ import pytest
 from lupin import cli, slots
 
 
-def test_acquire_respects_max_third_call_is_full(tmp_path):
+def test_acquire_respects_max_third_call_is_full(tmp_path, clean_lupin_env):
     root = str(tmp_path)
     assert cli.main(["acquire", "bmo", "--holder", "a", "--max", "2", "--state-root", root]) == 0
     assert cli.main(["acquire", "bmo", "--holder", "b", "--state-root", root]) == 0
@@ -64,7 +64,7 @@ def test_release_malformed_lease_id_is_an_error(tmp_path):
     assert code == 1
 
 
-def test_status_json_reports_accurate_counts(tmp_path, capsys):
+def test_status_json_reports_accurate_counts(tmp_path, capsys, clean_lupin_env):
     root = str(tmp_path)
     cli.main(["acquire", "bmo", "--holder", "a", "--max", "2", "--state-root", root])
     cli.main(["acquire", "bmo", "--holder", "b", "--state-root", root])
@@ -97,6 +97,58 @@ def test_hold_releases_on_nonzero_exit(tmp_path):
         state_root=root,
     )
     assert code == 3
+    assert slots.status(state_root=root)["bmo"]["holders"] == 0
+
+
+def test_hold_keeps_renewing_after_repeated_renew_errors(tmp_path, monkeypatch, capsys):
+    root = str(tmp_path)
+    real_renew = slots.renew
+    calls = []
+
+    def renew_fails_twice(lease, **kwargs):
+        calls.append(lease)
+        if len(calls) in (1, 2):
+            raise OSError("renew broke")
+        return real_renew(lease, **kwargs)
+
+    monkeypatch.setattr(slots, "renew", renew_fails_twice)
+    code = slots.hold(
+        [sys.executable, "-c", "import time; time.sleep(0.5)"],
+        slot="bmo",
+        holder="a",
+        max_holders=1,
+        ttl=0.3,
+        state_root=root,
+    )
+    assert code == 0
+    assert len(calls) >= 3, "renew was not called again after the errors"
+    assert capsys.readouterr().err.count("renew broke") == 1
+    assert slots.status(state_root=root)["bmo"]["holders"] == 0
+
+
+def test_hold_reports_a_new_failure_after_a_success(tmp_path, monkeypatch, capsys):
+    root = str(tmp_path)
+    real_renew = slots.renew
+    calls = []
+
+    def renew_fails_first_and_third(lease, **kwargs):
+        calls.append(lease)
+        if len(calls) in (1, 3):
+            raise OSError("renew broke")
+        return real_renew(lease, **kwargs)
+
+    monkeypatch.setattr(slots, "renew", renew_fails_first_and_third)
+    code = slots.hold(
+        [sys.executable, "-c", "import time; time.sleep(0.5)"],
+        slot="bmo",
+        holder="a",
+        max_holders=1,
+        ttl=0.3,
+        state_root=root,
+    )
+    assert code == 0
+    assert len(calls) >= 3, "renew was not called a third time"
+    assert capsys.readouterr().err.count("renew broke") == 2
     assert slots.status(state_root=root)["bmo"]["holders"] == 0
 
 

@@ -68,6 +68,7 @@ import os
 import re
 import socket
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from importlib import resources
@@ -645,8 +646,9 @@ def refresh_snapshot(*, force: bool = False, holder: str | None = None, **connec
         fresh = fetch_benchmark_scores(needed, previous=cached_scores)
         try:
             client.set(REDIS_KEY, json.dumps(fresh), ex=REDIS_KEY_TTL)
-        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError):
-            pass  # the fetch itself still succeeded or failed honestly; report it even if the cache write didn't land
+        except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as exc:
+            # Keep the fetch result. Do not retry the write.
+            print(f"warning: benchmark scores fetched but not cached (Redis write failed: {exc})", file=sys.stderr)
     finally:
         try:
             slots_redis.release(lease, **connection)
