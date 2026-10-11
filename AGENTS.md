@@ -397,6 +397,8 @@ per-machine limit or add controls that the current code cannot support.
 
 ## Build and test
 
+Full gate (the repo's gate, used by the merge rules):
+
 ```
 nix flake check                                    # build + test, all systems
 nix shell nixpkgs#python3Packages.pytest -c pytest -v
@@ -408,10 +410,10 @@ Every feature change goes through a pull request to the fork's `release/next`.
 Policy changes go to upstream `main` for the owner to merge. The loop policy is
 in `docs/delegation-loop.md`.
 
-1. Push the branch to the fork with `git push fork <branch>`. Never push to
-   `origin`. Do not add a remote. Do not use `/ship`. It pushes to `origin`
-   when direct push is allowed, and it can add a remote. Open the PR on the
-   fork:
+1. Push with `git push fork <branch>`. Never push to `origin`, `main`, or
+   `release/next`. Never run `git remote add`. Do not use the commit and PR
+   section of `/ship`. It pushes to `origin` when direct push is allowed, and it
+   can add a remote. Open the PR on the fork:
 
    <!-- markdownlint-disable MD013 -->
    ```sh
@@ -420,9 +422,11 @@ in `docs/delegation-loop.md`.
    <!-- markdownlint-enable MD013 -->
 
    The PR body has `Closes #N`. The merge into `release/next` does not close
-   the issue. Close it by hand in the same pass. If the push fails, report the
-   branch name and commit range. Do not merge that branch. The merge rules are
-   in the `delegation-loop` skill.
+   the issue. The orchestrator (the agent that dispatches and merges work)
+   closes it manually, in the same work session. If the push fails, report the
+   branch name and commit range. Do not merge that branch. If the PR opens,
+   report its number to the orchestrator. The orchestrator dispatches
+   `/code-review`.
 2. Do not merge your own work. A reviewer who is not the author runs
    `/code-review`. The orchestrator (the agent that dispatches and merges
    work) merges into `release/next` only when all four are true:
@@ -434,6 +438,8 @@ in `docs/delegation-loop.md`.
       asks git whether one branch contains another. The check is in the
       `delegation-loop` skill.
    4. The repo's full gate, as its `AGENTS.md` defines it, passes.
+
+   A worker or reviewer never merges a pull request.
 3. At the end of a session, run `/handoff`. It runs `lupin ledger append`.
 4. Loop details for this repo: `docs/delegation-loop.md`.
 
@@ -457,11 +463,13 @@ sys.exit(main(["serve", "--bind", "127.0.0.1", "--port", "8789"]))
 - Port: `8789`. Check it is free with `ss -ltn` first. The `ss` command lists
   listening ports.
 - Machine: not set yet. The owner names it.
-- Owner tunnel command: `ssh -N -L 8789:127.0.0.1:8789 MACHINE`.
+- Owner tunnel command: `ssh -N -L 8789:127.0.0.1:8789 MACHINE`. A tunnel
+  forwards a port on your computer to the machine.
 - Local URL: `http://localhost:8789`.
 - Keep it running: a Herdr pane, or `systemd-run --user`. The `systemd-run`
   command starts a command as a background service.
-- Never bind to `0.0.0.0`. This is a security rule.
+- To bind means to choose the address a server listens on. Never bind to
+  `0.0.0.0`. This is a security rule.
 - Do not set `LUPIN_REDIS_HOST` to the fleet Redis unless the test needs it.
 - Do not use the start, stop, or run controls on this dashboard. New runs use
   the `lupin-loops` session. Older loops may use an old session until they

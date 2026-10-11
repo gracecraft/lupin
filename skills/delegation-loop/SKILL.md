@@ -154,8 +154,8 @@ Give each worker a short brief with:
 - Machine, absolute worktree path, and branch.
 - Required tests and smoke checks.
 
-Tell implementation workers to follow the push and PR steps in AGENTS.md
-item 1. Do not repeat the `/ship` implementation checklist.
+Tell implementation workers to follow `AGENTS.md`, rule 1 under "Pull requests,
+review, and handoff". Do not repeat the `/ship` implementation checklist.
 
 When an issue makes a major change to a web app's user interface or key user
 journey, and a preview is ready, dispatch a separate QA task with
@@ -289,9 +289,16 @@ gh pr create --repo gracecraft-ro/<repo> --base release/next --title "<title>" -
 ```
 <!-- markdownlint-enable MD013 -->
 
+The PR body has `Closes #N`. The merge into `release/next` does not close the
+issue. The orchestrator (the agent that dispatches and merges work) closes it
+manually, in the same work session.
+
 Do not open a feature PR against upstream `main`. If the push to the fork
 fails, the worker stops. The worker reports the local branch name and commit
 range. Do not review or merge the branch.
+
+Do not use the commit and PR section of `/ship`. It can push to `origin` and
+open an upstream PR. After the PR opens, report its number to the orchestrator.
 
 Use `lupin review-route --category CATEGORY --size SIZE --mode separate` for
 a reviewer recommendation. Compare it with the issue's implementation route
@@ -307,12 +314,10 @@ Never dispatch Fable without the user's approval. Use Opus sparingly because
 it costs more.
 
 If the review finds a problem, dispatch a `fix` worker with the exact finding.
-Tell it to push with `git push fork <branch>`, as in AGENTS.md item 1, and
-update the same PR. Review the latest PR commit.
-Repeat until the reviewer approves the current head SHA. The head SHA is the
-newest commit ID on the branch.
-The orchestrator (the agent that dispatches and merges work) posts the verdict
-and findings on the PR.
+Tell it to push with `git push fork <branch>` and update the same PR. Review
+the latest PR commit. Repeat until the reviewer approves the current head SHA.
+The head SHA is the newest commit ID on the branch. The orchestrator (the agent
+that dispatches and merges work) posts the verdict and findings on the PR.
 
 Before a branch is merged, it must contain the current `release/next`. Fetch
 the fork first. Then run this check. `BRANCH` is the PR branch name:
@@ -322,17 +327,20 @@ git fetch fork
 git merge-base --is-ancestor fork/release/next fork/BRANCH
 ```
 
-Exit code 0 means the fork branch contains `release/next`. Then continue to
-the merge rules below. Exit code 1 means it does not. For an open fork PR
-approved at its current head SHA, the worker runs `git merge fork/release/next`
-on the PR branch. If the merge has conflicts, report them and stop. Then it
-pushes the branch to the fork. Run the check again. If it exits 0, continue to
-the merge rules. Otherwise stop. Do not rebase. Any other exit code from the
-first check means the check failed. Report it and stop. Do not merge.
+Exit code 0 means the fork branch contains `release/next`. Then continue to the
+merge rules below. Exit code 1 means it does not. Use this step only for an open
+fork PR that is approved at its current head SHA. The worker syncs the PR branch
+with `git merge fork/release/next`. A sync is not a merge of the pull request.
+If the sync has conflicts, report them and stop. If it has no conflicts, push
+the branch to the fork. Run the check again. If it exits 0, get a new approval
+at the new head (see the next paragraph). Then continue to the merge rules.
+Otherwise stop. Do not rebase. Any other exit code from the first check means
+the check failed. Report it and stop. Do not merge.
 
 An approval binds to the head SHA. If the sync changed the head, get a new
 approval at the new head before you merge. The reviewer may limit that review
-to the files the sync changed. The gate runs in every case.
+to the files the sync changed. The gate (the set of checks that `AGENTS.md`
+defines) runs in every case.
 
 The orchestrator merges into `release/next` only when all four are true:
 
@@ -349,7 +357,7 @@ repo's `AGENTS.md`. If the repo has no gate command, report that. Do not merge.
 A branch with no fork PR is not merged.
 
 When all four conditions above are true, merge the PR with this command. No
-owner sign-off is needed. The reviewer approval above is still required.
+owner sign-off is needed. An approval at the current head SHA is still required.
 Record the approved SHA before you merge. The command creates a merge commit:
 
 ```sh
@@ -365,7 +373,8 @@ request.
 Each repo runs one preview server. It serves the repo's `release/next` only.
 Do not run a server for a feature branch.
 
-1. Create the preview worktree once. From the repo root, run:
+1. Create the preview worktree once. Detached means the worktree follows a
+   commit, not a branch. From the repo root, run:
 
    ```sh
    git fetch fork
@@ -381,8 +390,9 @@ Do not run a server for a feature branch.
    ```
 
    Then it restarts the server.
-3. Bind the server to `127.0.0.1` or to the Tailscale IP address. Tailscale
-   is a private network that links your own machines. Never bind to `0.0.0.0`.
+3. To bind means to choose the address a server listens on. Bind the server to
+   `127.0.0.1` or to the Tailscale IP address. Tailscale is a private network
+   that links your own machines. Never bind to `0.0.0.0`.
 4. Set `LUPIN_LOOP_STATE_DIR` to a scratch path. Do not point the preview at
    the real fleet Redis unless the test needs it.
 5. Keep the server running in a Herdr pane or with `systemd-run --user`. The

@@ -35,16 +35,19 @@ fail without triage access. Check before you write it into a report.
    git worktree add <path> -b <branch> fork/release/next
    ```
 
-3. Push the branch to the fork with `git push fork <branch>`. Never push to
-   `origin`. Do not add a remote. Do not use `/ship`. It pushes to `origin`
-   when direct push is allowed, and it can add a remote. Open the PR on the
-   fork:
+3. Push with `git push fork <branch>`. Never push to `origin`, `main`, or
+   `release/next`. Never run `git remote add`. Do not use the commit and PR
+   section of `/ship`. It pushes to `origin` when direct push is allowed, and it
+   can add a remote. Open the PR on the fork:
 
    <!-- markdownlint-disable MD013 -->
    ```sh
-   gh pr create --repo gracecraft-ro/lupin --base release/next --title "<title>" --body "Closes #N"
+   gh pr create --repo gracecraft-ro/<repo> --base release/next --title "<title>" --body "Closes #N"
    ```
    <!-- markdownlint-enable MD013 -->
+
+   If the PR opens, report its number to the orchestrator (the agent that
+   dispatches and merges work). The orchestrator dispatches `/code-review`.
 
 On a Herdr worker, use the Herdr worktree commands:
 
@@ -55,13 +58,14 @@ herdr worktree create --branch <branch> --base fork/release/next --cwd /code/lup
 ```
 
 A linked worktree shares its remotes with the checkout it came from. If that
-checkout has no `fork` remote, stop. Then report the missing remote.
-Do not add a remote.
+checkout has no `fork` remote, stop. Then report the missing remote to the
+orchestrator. Do not add a remote.
 
 `lupin run` still starts each loop from `origin/HEAD`, which is upstream `main`.
-It does not start from `fork/release/next`. Until the owner changes `lupin run`,
-do not use it for feature work. Create feature worktrees with the Herdr
-worktree commands above, or the manual steps in rule 1.
+`origin/HEAD` is the default branch on `origin`. `lupin run` does not start from
+`fork/release/next`. Until the owner changes `lupin run`, do not use it for
+feature work. Create feature worktrees with the Herdr worktree commands above,
+or the manual steps in rule 1.
 
 ## Pull request and review
 
@@ -71,9 +75,11 @@ repo:
 
 1. The base branch is the integration branch, `release/next`, on the fork
    (`gracecraft-ro/lupin`). A feature PR never targets upstream `main`.
-2. A worker follows rule 1 to push and open the PR. It can use `/ship` for
-   the work and the report. If the push fails, the worker stops.
-   Report the branch name and commit range. Do not review or merge the branch.
+2. A worker uses these `/ship` sections. They are "Check the issue and
+   checkout", "Implement and verify", "Save and attach evidence", and "Report
+   and release". It does not use its commit and PR section. It follows rule 1
+   for the push and the PR. If the push fails, report the branch name and commit
+   range. Do not merge that branch.
 3. The orchestrator (the agent that dispatches and merges work) dispatches
    `/code-review` for every PR, including docs-only changes. The reviewer is
    not the worker. The reviewer's model tier is not lower than the worker's.
@@ -96,7 +102,8 @@ repo:
    See the paragraph that starts "Before a branch is merged" in the
    `delegation-loop` skill. A worker or reviewer never merges a pull request.
    The PR body has `Closes #N`. The merge into `release/next` does not close
-   the issue. Close it by hand in the same pass.
+   the issue. The orchestrator (the agent that dispatches and merges work)
+   closes it manually, in the same work session.
 
 Changes to this policy go to upstream `main`, which the owner merges. Feature
 work goes to fork `release/next`.
